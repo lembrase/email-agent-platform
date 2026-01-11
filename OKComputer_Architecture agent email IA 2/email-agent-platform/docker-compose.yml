@@ -1,0 +1,184 @@
+version: '3.8'
+
+services:
+  # PostgreSQL Database
+  postgres:
+    image: postgres:15-alpine
+    container_name: email-agent-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: emailagent
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: emailagent
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./infrastructure/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql
+    networks:
+      - email-agent-network
+
+  # MongoDB
+  mongodb:
+    image: mongo:6.0
+    container_name: email-agent-mongodb
+    restart: unless-stopped
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: admin
+      MONGO_INITDB_ROOT_PASSWORD: password
+      MONGO_INITDB_DATABASE: emailagent
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongodb_data:/data/db
+    networks:
+      - email-agent-network
+
+  # Redis
+  redis:
+    image: redis:7-alpine
+    container_name: email-agent-redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - email-agent-network
+
+  # MinIO (Object Storage)
+  minio:
+    image: minio/minio:latest
+    container_name: email-agent-minio
+    restart: unless-stopped
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+    command: server /data --console-address ":9001"
+    networks:
+      - email-agent-network
+
+  # Backend API
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: email-agent-backend
+    restart: unless-stopped
+    environment:
+      NODE_ENV: development
+      PORT: 3001
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_USERNAME: emailagent
+      DB_PASSWORD: password
+      DB_NAME: emailagent
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      JWT_SECRET: your-super-secret-jwt-key
+      JWT_EXPIRES_IN: 1h
+      JWT_REFRESH_EXPIRES_IN: 7d
+      ENCRYPTION_KEY: your-32-character-encryption-key
+      CORS_ORIGIN: http://localhost:3000
+      AI_ENGINE_URL: http://ai-engine:8000
+    ports:
+      - "3001:3001"
+    volumes:
+      - ./backend:/app
+      - /app/node_modules
+    depends_on:
+      - postgres
+      - redis
+      - mongodb
+    networks:
+      - email-agent-network
+    command: npm run start:dev
+
+  # AI Engine
+  ai-engine:
+    build:
+      context: ./ai-engine
+      dockerfile: Dockerfile
+    container_name: email-agent-ai-engine
+    restart: unless-stopped
+    environment:
+      HOST: 0.0.0.0
+      PORT: 8000
+      DATABASE_URL: postgresql://emailagent:password@postgres:5432/emailagent
+      MONGODB_URL: mongodb://admin:password@mongodb:27017/emailagent?authSource=admin
+      REDIS_URL: redis://redis:6379/0
+      S3_ENDPOINT: minio:9000
+      S3_ACCESS_KEY: minioadmin
+      S3_SECRET_KEY: minioadmin
+      S3_BUCKET_NAME: email-agent
+      S3_USE_SSL: false
+      LOG_LEVEL: INFO
+    ports:
+      - "8000:8000"
+      - "9090:9090"  # Metrics
+    volumes:
+      - ./ai-engine:/app
+      - ai_models:/app/models
+    depends_on:
+      - postgres
+      - mongodb
+      - redis
+      - minio
+    networks:
+      - email-agent-network
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+
+  # Frontend
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: email-agent-frontend
+    restart: unless-stopped
+    environment:
+      VITE_API_URL: http://localhost:3001
+      VITE_WS_URL: ws://localhost:3001
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    depends_on:
+      - backend
+    networks:
+      - email-agent-network
+    command: npm run dev
+
+  # Nginx (Reverse Proxy)
+  nginx:
+    image: nginx:alpine
+    container_name: email-agent-nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./infrastructure/nginx/nginx.conf:/etc/nginx/nginx.conf
+      - ./infrastructure/nginx/ssl:/etc/nginx/ssl
+    depends_on:
+      - frontend
+      - backend
+    networks:
+      - email-agent-network
+
+volumes:
+  postgres_data:
+  mongodb_data:
+  redis_data:
+  minio_data:
+  ai_models:
+
+networks:
+  email-agent-network:
+    driver: bridge
